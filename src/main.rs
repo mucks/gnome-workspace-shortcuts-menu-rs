@@ -39,7 +39,9 @@ struct WorkspaceKeybinding {
 struct MyApp {
     modifier_vec: Vec<Modifier>,
     workspace_keybinding_map: BTreeMap<usize, WorkspaceKeybinding>,
-    keysyms: HashMap<String, String>,
+    key_to_keysym: HashMap<String, String>,
+    keysym_to_key: HashMap<String, String>,
+    num_of_workspaces: String,
 }
 
 impl Default for MyApp {
@@ -47,12 +49,14 @@ impl Default for MyApp {
         Self {
             modifier_vec: get_vec(),
             workspace_keybinding_map: BTreeMap::new(),
-            keysyms: HashMap::new(),
+            key_to_keysym: HashMap::new(),
+            keysym_to_key: HashMap::new(),
+            num_of_workspaces: "4".into(),
         }
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct Modifier {
     pub name: String,
     pub gsettings_value: String,
@@ -78,36 +82,99 @@ fn get_vec() -> Vec<Modifier> {
     ]
 }
 
-fn get_gsettings_value_from_key(gsettings_key: &str) -> Result<String> {
-    Ok(String::from_utf8(
-        Command::new("gsettings")
-            .arg("get")
-            .arg("org.gnome.desktop.wm.keybindings")
-            .arg(gsettings_key)
+const EMPTY_KEYBINDING: &str = "[\"\"]";
+
+struct GSettings;
+
+impl GSettings {
+    // id is 1-9
+
+    fn disable_switch_to_application_shortcuts() -> Result<()> {
+        for i in 1..10 {
+            Self::set_switch_to_application_keybinding(i, EMPTY_KEYBINDING)?;
+        }
+        Ok(())
+    }
+
+    fn set_switch_to_application_keybinding(id: u32, gsettings_value: &str) -> Result<()> {
+        let _ = Command::new("gsettings")
+            .arg("set")
+            .arg("org.gnome.shell.keybindings")
+            .arg(format!("switch-to-application-{id}"))
+            .arg(gsettings_value)
             .output()?
-            .stdout,
-    )?)
+            .stdout;
+        Ok(())
+    }
+
+    fn set_number_of_workspaces(num: usize) -> Result<()> {
+        let _ = Command::new("gsettings")
+            .arg("set")
+            .arg("org.gnome.desktop.wm.preferences")
+            .arg("num-workspaces")
+            .arg(num.to_string())
+            .output()?
+            .stdout;
+        Ok(())
+    }
+    fn get_number_of_workspaces() -> Result<usize> {
+        Ok(String::from_utf8(
+            Command::new("gsettings")
+                .arg("get")
+                .arg("org.gnome.desktop.wm.preferences")
+                .arg("num-workspaces")
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .parse()?)
+    }
+    fn get_wm_keybinding(gsettings_key: &str) -> Result<String> {
+        Ok(String::from_utf8(
+            Command::new("gsettings")
+                .arg("get")
+                .arg("org.gnome.desktop.wm.keybindings")
+                .arg(gsettings_key)
+                .output()?
+                .stdout,
+        )?)
+    }
+
+    fn set_wm_keybinding(gsettings_key: &str, gsettings_value: &str) -> Result<()> {
+        let s = String::from_utf8(
+            Command::new("gsettings")
+                .arg("set")
+                .arg("org.gnome.desktop.wm.keybindings")
+                .arg(gsettings_key)
+                .arg(gsettings_value)
+                .output()?
+                .stdout,
+        )?;
+        println!("{}", s);
+        Ok(())
+    }
 }
 
 impl MyApp {
     fn new() -> Self {
         let mut app = Self::default();
+        app.init_keysyms();
         app.gen_workspace_keybinding_map();
         app.get_gsettings_values_from_config();
-        app.init_keysyms();
-        println!("{:#?}", app.keysyms);
+        app.num_of_workspaces = GSettings::get_number_of_workspaces().unwrap().to_string();
         app
     }
 
     fn init_keysyms(&mut self) {
-        let keys: &str = include_str!("../test.txt");
+        let keys: &str = include_str!("../gnome-keysyms.txt");
 
         let lines: Vec<&str> = keys.split('\n').collect();
 
         for line in lines {
             let s: Vec<&str> = line.split_whitespace().collect();
             if s.len() >= 3 {
-                self.keysyms.insert(s[2].into(), s[0].into());
+                self.key_to_keysym.insert(s[2].into(), s[0].into());
+                self.keysym_to_key.insert(s[0].into(), s[2].into());
             }
         }
     }
@@ -144,9 +211,48 @@ impl MyApp {
         }
     }
 
+    fn get_gsettings_value_from_config(&mut self, i: usize) -> Result<()> {
+        let v = self.workspace_keybinding_map.get_mut(&i).unwrap();
+        v.gsettings_value = GSettings::get_wm_keybinding(&v.gsettings_key)?;
+
+        // save the original index of modifier vec
+        let mut m_vals: Vec<(usize, Modifier)> = vec![];
+        for i in 0..self.modifier_vec.len() {
+            let v = (i, self.modifier_vec[i].clone());
+            m_vals.push(v);
+        }
+
+        // reverse sort array by string length to get the longest common string first
+        m_vals.sort_by(|a, b| b.1.gsettings_value.len().cmp(&a.1.gsettings_value.len()));
+
+        for (i, m) in m_vals {
+            if !m.gsettings_value.is_empty() && v.gsettings_value.contains(&m.gsettings_value) {
+                v.modifier_index = i;
+                break;
+            }
+        }
+        let m = self.modifier_vec[v.modifier_index]
+            .gsettings_value
+            .to_string();
+
+        let keysym = v
+            .gsettings_value
+            .replace(&m, "")
+            .replace(['\'', '[', ']'], "")
+            .replace("@as", "")
+            .trim()
+            .to_string();
+
+        v.keybinding = match self.keysym_to_key.get(&keysym) {
+            Some(key) => key.to_string(),
+            None => keysym.to_string(),
+        };
+        Ok(())
+    }
+
     fn get_gsettings_values_from_config(&mut self) -> Result<()> {
-        for (k, v) in &mut self.workspace_keybinding_map {
-            v.gsettings_value = get_gsettings_value_from_key(&v.gsettings_key)?;
+        for k in self.workspace_keybinding_map.clone().keys() {
+            self.get_gsettings_value_from_config(*k)?;
         }
         Ok(())
     }
@@ -181,7 +287,7 @@ impl MyApp {
                     selection.keybinding.chars().collect::<Vec<char>>()[0].into();
             }
 
-            let keybind = match self.keysyms.get(&selection.keybinding) {
+            let keybind = match self.key_to_keysym.get(&selection.keybinding) {
                 Some(keysym) => keysym.to_string(),
                 None => selection.keybinding.to_string(),
             };
@@ -197,6 +303,22 @@ impl MyApp {
 
             let te3 = TextEdit::singleline(&mut selection.gsettings_value).interactive(false);
             ui.add_sized(Vec2::new(300.0, 20.0), te3);
+
+            if ui.button("Overwrite").clicked() {
+                let res = GSettings::set_wm_keybinding(
+                    &selection.gsettings_key,
+                    &selection.converted_keybinding,
+                );
+
+                match res {
+                    Ok(()) => {
+                        self.get_gsettings_value_from_config(k).unwrap();
+                    }
+                    Err(e) => {
+                        println!("{}", e);
+                    }
+                }
+            }
         });
     }
 }
@@ -204,10 +326,26 @@ impl MyApp {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            // let events = ui.input().events.clone();
-            // for event in events {
-            //     // println!("{:?}", event);
-            // }
+            ui.horizontal(|ui| {
+                ui.label("Number of Workspaces");
+                let te = TextEdit::singleline(&mut self.num_of_workspaces);
+                ui.add_sized(Vec2::new(40.0, 20.0), te);
+                if ui.button("Overwrite").clicked() {
+                    GSettings::set_number_of_workspaces(self.num_of_workspaces.parse().unwrap())
+                        .unwrap();
+                    self.num_of_workspaces =
+                        GSettings::get_number_of_workspaces().unwrap().to_string();
+                }
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Disable switch-to-application shortcuts")
+                    .clicked()
+                {
+                    GSettings::disable_switch_to_application_shortcuts().unwrap();
+                }
+            });
 
             ui.heading("Shortcuts");
             for (k, _) in self.workspace_keybinding_map.clone() {
